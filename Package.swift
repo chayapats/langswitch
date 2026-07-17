@@ -2,18 +2,25 @@
 import PackageDescription
 
 let package = Package(
-    name: "CapsLangSwitcher",
+    name: "LangSwitch",
     platforms: [.macOS(.v12)],
-    dependencies: [
-        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.7.0"),
+    products: [
+        .executable(name: "LangSwitch", targets: ["LangSwitch"]),
     ],
     targets: [
+        .target(
+            name: "LangSwitchCore",
+            path: "Sources/LangSwitchCore"
+        ),
         .executableTarget(
-            name: "CapsLangSwitcher",
-            dependencies: [
-                .product(name: "Sparkle", package: "Sparkle"),
-            ],
+            name: "LangSwitch",
+            dependencies: ["LangSwitchCore"],
             path: "Sources/CapsLangSwitcher"
-        )
+        ),
+        .testTarget(
+            name: "LangSwitchTests",
+            dependencies: ["LangSwitchCore"],
+            path: "Tests/LangSwitchTests"
+        ),
     ]
 )

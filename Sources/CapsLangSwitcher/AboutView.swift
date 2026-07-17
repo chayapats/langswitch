@@ -26,7 +26,7 @@ struct AboutView: View {
                 .frame(width: 110, height: 110)
                 .shadow(color: Color(red: 0.8, green: 0.44, blue: 0.3).opacity(0.35), radius: 14, y: 6)
 
-            Text("CapsLangSwitcher")
+            Text("LangSwitch")
                 .font(.title2).bold()
             Text("Version \(version)")
                 .font(.caption)
@@ -40,20 +40,15 @@ struct AboutView: View {
             Divider().padding(.horizontal, 30)
 
             VStack(spacing: 4) {
-                Text("Created by")
+                Text("Hardened local build")
                     .font(.caption2)
                     .foregroundColor(.secondary)
-                Text("Gamezxz 🧙‍♂️")
-                    .font(.headline)
+                Text("No telemetry · No network · No auto-update")
+                    .font(.callout)
+                    .multilineTextAlignment(.center)
             }
 
-            HStack(spacing: 14) {
-                Link("GitHub", destination: URL(string: "https://github.com/Gamezxz/CapsLangSwitcher")!)
-                Link("Website", destination: URL(string: "https://gamezxz.github.io/CapsLangSwitcher/")!)
-            }
-            .font(.callout)
-
-            Text("© 2026 Gamezxz — free & open source")
+            Text("Based on CapsLangSwitcher by Gamezxz (MIT)")
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }

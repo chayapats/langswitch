@@ -1,28 +1,94 @@
 import Cocoa
 import SwiftUI
 import Carbon
-import Sparkle
+import Darwin
+import LangSwitchCore
+import ServiceManagement
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+private let launchAtLoginConfiguredKey = "didConfigureLaunchAtLogin"
+private let nativeIndicatorPriorValueKey = "nativeIndicatorPriorValue"   // "true" | "absent"
+private let nativeIndicatorNoticeShownKey = "didShowNativeIndicatorNotice"
+
+@available(macOS 13.0, *)
+private func launchAtLoginStatusName(_ status: SMAppService.Status) -> String {
+    switch status {
+    case .notRegistered: return "not registered"
+    case .enabled: return "enabled"
+    case .requiresApproval: return "approval required"
+    case .notFound: return "not found"
+    @unknown default: return "unknown"
+    }
+}
+
+/// Handles installer diagnostics without creating NSApplication or requesting Accessibility.
+private func loginItemCommandExitCodeIfRequested(
+    arguments: [String] = CommandLine.arguments
+) -> Int32? {
+    guard arguments.count == 2 else { return nil }
+    let command = arguments[1]
+    guard command == "--register-login-item" || command == "--login-item-status" else {
+        return nil
+    }
+
+    guard #available(macOS 13.0, *) else {
+        print("Launch at Login requires macOS 13 or later")
+        return 2
+    }
+
+    let service = SMAppService.mainApp
+    if command == "--register-login-item",
+       service.status == .notRegistered || service.status == .notFound {
+        do {
+            try service.register()
+            UserDefaults.standard.set(true, forKey: launchAtLoginConfiguredKey)
+        } catch {
+            fputs("Could not register Launch at Login: \(error.localizedDescription)\n", stderr)
+            return 1
+        }
+    }
+
+    print("Launch at Login: \(launchAtLoginStatusName(service.status))")
+    return 0
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let tap = CapsLockTap()
-    private var updaterController: SPUStandardUpdaterController!
+    private let hud = LanguageIndicatorHUD()
     private var aboutWindow: NSWindow?
+    private var instanceLock: SingleInstanceLock?
+    private var signalHandler: TerminationSignalHandler?
+    private weak var launchAtLoginItem: NSMenuItem?
+    private weak var runtimeStatusItem: NSMenuItem?
+    private var isTerminating = false
+    private var ownsNativeIndicatorSetting = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let icon = NSImage(systemSymbolName: "capslock.fill", accessibilityDescription: "CapsLangSwitcher")
-        icon?.isTemplate = true // adapts to light/dark menu bar automatically, like other status items
-        statusItem.button?.image = icon
-        buildMenu()
-        updateStatusTitle()
+        guard let lock = SingleInstanceLock() else {
+            let alert = NSAlert()
+            alert.messageText = "LangSwitch is already running"
+            alert.informativeText = "Only one instance can own the Caps Lock mapping at a time."
+            alert.runModal()
+            NSApp.terminate(nil)
+            return
+        }
+        instanceLock = lock
 
-        // Sparkle auto-updater (checks SUFeedURL on launch + daily)
-        updaterController = SPUStandardUpdaterController(
-            startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        configureLaunchAtLoginIfNeeded()
+        suppressNativeIndicator()
+
+        signalHandler = TerminationSignalHandler { [weak self] in
+            guard self?.isTerminating == false else { return }
+            NSApp.terminate(nil)
+        }
+
+        buildMenu()
+        setRuntimeStatus("Status: Waiting for Accessibility…", isActive: false)
+        updateStatusTitle()
 
         DistributedNotificationCenter.default().addObserver(
             self,
-            selector: #selector(updateStatusTitle),
+            selector: #selector(inputSourceDidChange),
             name: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
             object: nil
         )
@@ -42,18 +108,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             InputSourceSwitcher.selectNext()
             self?.updateStatusTitle()
         }
-        if !tap.start() {
+        tap.onFailure = { [weak self] error in
+            guard let self, !self.isTerminating else { return }
+            self.setRuntimeStatus("Status: Stopped — mapping restored", isActive: false)
             let alert = NSAlert()
-            alert.messageText = "Couldn't start Caps Lock capture"
-            alert.informativeText = "Grant Accessibility access to CapsLangSwitcher in System Settings > Privacy & Security, then relaunch."
+            alert.messageText = "Caps Lock capture stopped"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+
+        do {
+            try tap.start()
+            updateStatusTitle()
+        } catch {
+            setRuntimeStatus("Status: Stopped — see error", isActive: false)
+            let alert = NSAlert()
+            alert.messageText = "Caps Lock capture did not start"
+            alert.informativeText = "LangSwitch left your previous keyboard mapping unchanged.\n\n\(error.localizedDescription)"
             alert.runModal()
         }
     }
 
     private func promptForAccessibility() {
-        // Poll until the user grants access in System Settings, then start the tap.
+        guard !isTerminating else { return }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            guard let self else { return }
+            guard let self, !self.isTerminating else { return }
             if AXIsProcessTrusted() {
                 self.startTap()
             } else {
@@ -62,29 +142,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    @objc private func updateStatusTitle() {
-        // Icon stays fixed; the tooltip shows which input source is active on hover.
+    @objc private func inputSourceDidChange() {
+        updateStatusTitle()
         guard let source = InputSourceSwitcher.currentSource() else { return }
-        statusItem.button?.toolTip = InputSourceSwitcher.localizedName(source)
+        hud.show(for: source)
+    }
+
+    @objc private func updateStatusTitle() {
+        guard let source = InputSourceSwitcher.currentSource() else { return }
+        let sourceName = InputSourceSwitcher.localizedName(source)
+        if tap.isRunning {
+            setRuntimeStatus("Status: Active — \(sourceName)", isActive: true)
+        } else {
+            statusItem.button?.toolTip = "LangSwitch — Waiting for Accessibility"
+        }
     }
 
     private func buildMenu() {
         let menu = NSMenu()
-        menu.addItem(withTitle: "CapsLangSwitcher", action: nil, keyEquivalent: "").isEnabled = false
+        menu.delegate = self
+
+        let heading = menu.addItem(
+            withTitle: "Status: Waiting for Accessibility…",
+            action: nil,
+            keyEquivalent: ""
+        )
+        heading.isEnabled = false
+        runtimeStatusItem = heading
         menu.addItem(.separator())
 
-        addItem(to: menu, "Open Accessibility Settings…", #selector(openAccessibilitySettings), symbol: "accessibility")
-        addItem(to: menu, "Check for Updates…", #selector(checkForUpdates), symbol: "arrow.triangle.2.circlepath")
-        addItem(to: menu, "What's New…", #selector(openChangelog), symbol: "sparkles")
-        addItem(to: menu, "About CapsLangSwitcher", #selector(openAbout), symbol: "info.circle")
+        addItem(
+            to: menu,
+            "Open Accessibility Settings…",
+            #selector(openAccessibilitySettings),
+            symbol: "accessibility"
+        )
+        let launchAtLogin = NSMenuItem(
+            title: "Launch at Login",
+            action: #selector(toggleLaunchAtLogin),
+            keyEquivalent: ""
+        )
+        launchAtLogin.target = self
+        launchAtLogin.image = NSImage(
+            systemSymbolName: "arrow.clockwise.circle",
+            accessibilityDescription: nil
+        )
+        menu.addItem(launchAtLogin)
+        launchAtLoginItem = launchAtLogin
+        updateLaunchAtLoginItem()
+
+        addItem(to: menu, "About LangSwitch", #selector(openAbout), symbol: "info.circle")
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        quit.target = NSApp // NSApplication.terminate(_:) lives on NSApp, not on this delegate
+        let quit = NSMenuItem(
+            title: "Quit & Restore Caps Lock",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quit.target = NSApp
         quit.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
         menu.addItem(quit)
 
         statusItem.menu = menu
+    }
+
+    private func setRuntimeStatus(_ title: String, isActive: Bool) {
+        runtimeStatusItem?.title = title
+        let symbolName = isActive ? "capslock.fill" : "capslock"
+        let icon = NSImage(systemSymbolName: symbolName, accessibilityDescription: "LangSwitch")
+        icon?.isTemplate = true
+        statusItem.button?.image = icon
+        statusItem.button?.toolTip = isActive
+            ? title.replacingOccurrences(of: "Status: ", with: "LangSwitch — ")
+            : "LangSwitch — Waiting for Accessibility"
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        updateLaunchAtLoginItem()
     }
 
     private func addItem(to menu: NSMenu, _ title: String, _ action: Selector, symbol: String) {
@@ -99,47 +233,176 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSWorkspace.shared.open(url)
     }
 
-    @objc private func checkForUpdates() {
-        updaterController?.updater.checkForUpdates()
+    private func configureLaunchAtLoginIfNeeded() {
+        guard #available(macOS 13.0, *), isInstalledInApplicationsFolder else { return }
+        guard !UserDefaults.standard.bool(forKey: launchAtLoginConfiguredKey) else { return }
+
+        let service = SMAppService.mainApp
+        guard service.status == .notRegistered || service.status == .notFound else {
+            UserDefaults.standard.set(true, forKey: launchAtLoginConfiguredKey)
+            return
+        }
+
+        if (try? service.register()) != nil {
+            // Record only a successful registration attempt. A failure is retried on the
+            // next manual launch and remains visible as an unchecked menu item.
+            UserDefaults.standard.set(true, forKey: launchAtLoginConfiguredKey)
+        }
     }
 
-    @objc private func openChangelog() {
-        if let url = URL(string: "https://gamezxz.github.io/CapsLangSwitcher/changelog") {
-            NSWorkspace.shared.open(url)
+    /// Disables macOS's native near-cursor language indicator, which shows the *previous*
+    /// source after a programmatic switch. LangSwitch shows its own correct HUD instead.
+    /// Preference failures never throw and never block startup.
+    private func suppressNativeIndicator() {
+        ownsNativeIndicatorSetting = true
+        let key = "TSMLanguageIndicatorEnabled" as CFString
+        let current = CFPreferencesCopyAppValue(key, kCFPreferencesAnyApplication) as? Bool
+        guard current != false else { return }   // already suppressed (idempotent after crash)
+        if UserDefaults.standard.string(forKey: nativeIndicatorPriorValueKey) == nil {
+            UserDefaults.standard.set(current == true ? "true" : "absent",
+                                      forKey: nativeIndicatorPriorValueKey)
+        }
+        CFPreferencesSetAppValue(key, kCFBooleanFalse, kCFPreferencesAnyApplication)
+        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
+        showNativeIndicatorNoticeIfNeeded()
+    }
+
+    /// Restores the value that existed before this app disabled the native indicator,
+    /// removing our override entirely if there was none. Only the instance that actually
+    /// suppressed the setting restores it, so a duplicate-instance launch cannot clobber it.
+    private func restoreNativeIndicator() {
+        guard ownsNativeIndicatorSetting,
+              let saved = UserDefaults.standard.string(forKey: nativeIndicatorPriorValueKey)
+        else { return }
+        let key = "TSMLanguageIndicatorEnabled" as CFString
+        CFPreferencesSetAppValue(key, saved == "true" ? kCFBooleanTrue : nil,
+                                 kCFPreferencesAnyApplication)   // nil removes our override
+        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
+        UserDefaults.standard.removeObject(forKey: nativeIndicatorPriorValueKey)
+    }
+
+    private func showNativeIndicatorNoticeIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: nativeIndicatorNoticeShownKey) else { return }
+        UserDefaults.standard.set(true, forKey: nativeIndicatorNoticeShownKey)
+
+        let alert = NSAlert()
+        alert.messageText = "LangSwitch replaces the macOS language indicator"
+        alert.informativeText = """
+        macOS's built-in near-cursor language indicator shows the previous language after a \
+        switch, so LangSwitch disables it and shows its own indicator with the correct language \
+        immediately. One logout or restart is needed for the native badge to fully disappear. \
+        LangSwitch restores your original setting when it quits.
+        """
+        alert.runModal()
+    }
+
+    private var isInstalledInApplicationsFolder: Bool {
+        let bundlePath = Bundle.main.bundleURL.standardizedFileURL.path
+        let userApplications = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications", isDirectory: true)
+            .standardizedFileURL.path + "/"
+
+        return bundlePath.hasPrefix(userApplications) || bundlePath.hasPrefix("/Applications/")
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        guard #available(macOS 13.0, *) else { return }
+
+        let service = SMAppService.mainApp
+        do {
+            switch service.status {
+            case .enabled:
+                try service.unregister()
+            case .requiresApproval:
+                SMAppService.openSystemSettingsLoginItems()
+            case .notRegistered, .notFound:
+                try service.register()
+            @unknown default:
+                throw NSError(
+                    domain: "com.chayapats.langswitch",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Unknown Login Item status"]
+                )
+            }
+            UserDefaults.standard.set(true, forKey: launchAtLoginConfiguredKey)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not change Launch at Login"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+
+        updateLaunchAtLoginItem()
+    }
+
+    private func updateLaunchAtLoginItem() {
+        guard let item = launchAtLoginItem else { return }
+        guard #available(macOS 13.0, *) else {
+            item.title = "Launch at Login — Requires macOS 13"
+            item.state = .off
+            item.isEnabled = false
+            return
+        }
+
+        item.isEnabled = true
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            item.title = "Launch at Login"
+            item.state = .on
+        case .requiresApproval:
+            item.title = "Launch at Login — Approval Required…"
+            item.state = .mixed
+        case .notRegistered, .notFound:
+            item.title = "Launch at Login"
+            item.state = .off
+        @unknown default:
+            item.title = "Launch at Login"
+            item.state = .off
         }
     }
 
     @objc private func openAbout() {
         if aboutWindow == nil {
-            let w = NSWindow(
+            let window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 340, height: 420),
-                styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            w.title = "About CapsLangSwitcher"
-            w.contentView = NSHostingView(rootView: AboutView())
-            w.isReleasedWhenClosed = false
-            w.delegate = self
-            w.center()
-            aboutWindow = w
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "About LangSwitch"
+            window.contentView = NSHostingView(rootView: AboutView())
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            window.center()
+            aboutWindow = window
         }
-        // Menu-bar app (.accessory) can't receive keyboard focus
-        // → switch to .regular temporarily so the window can become key
+
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         aboutWindow?.makeKeyAndOrderFront(nil)
     }
 
-    // Return to menu-bar mode when the About window closes (hide from Dock)
     func windowWillClose(_ notification: Notification) {
         if (notification.object as? NSWindow) === aboutWindow {
             NSApp.setActivationPolicy(.accessory)
         }
     }
 
-    // Restore Caps Lock to normal on quit — otherwise it stays remapped to F18 (a dead key)
-    // while the app isn't running to handle it.
     func applicationWillTerminate(_ notification: Notification) {
-        tap.clearRemap()
+        isTerminating = true
+        DistributedNotificationCenter.default().removeObserver(self)
+        tap.stop()
+        restoreNativeIndicator()
+        signalHandler = nil
     }
+}
+
+if let watchdogExitCode = HIDMappingManager.watchdogExitCodeIfRequested() {
+    exit(watchdogExitCode)
+}
+
+if let loginItemExitCode = loginItemCommandExitCodeIfRequested() {
+    exit(loginItemExitCode)
 }
 
 let app = NSApplication.shared

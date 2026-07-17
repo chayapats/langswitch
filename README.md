@@ -1,92 +1,110 @@
-<p align="center">
-  <img src="assets/logo.png" width="120" alt="CapsLangSwitcher logo">
-</p>
+# LangSwitch
 
-<h1 align="center">CapsLangSwitcher</h1>
+Personal hardened fork of [CapsLangSwitcher](https://github.com/Gamezxz/CapsLangSwitcher),
+based on audited upstream commit `34c5ef2d64b4c5c3a2df55c289a56667bd3adeeb`.
 
-<p align="center">
-  Tap Caps Lock, switch input languages — instantly. No macOS hotkey delay, ever.
-</p>
+Tap Caps Lock to cycle the enabled macOS keyboard input sources without the normal
+Caps Lock activation delay.
 
-## Why
+## Language indicator
 
-On macOS, binding Caps Lock to "switch input source" goes through the system's
-hotkey-disambiguation logic, which adds a noticeable delay before the switch
-actually happens — especially annoying for Thai/English (ก/A) switching. On top
-of that, Apple's built-in keyboards apply a firmware "hold briefly to engage"
-delay to Caps Lock itself, so even a custom app that watches the caps-lock state
-change (`flagsChanged`) still has to wait that delay out.
+macOS's built-in near-cursor language indicator (`TSMLanguageIndicatorEnabled`) shows the
+*previous* input source after a programmatic switch, so LangSwitch disables it on launch and
+shows its own small indicator at the mouse cursor with the correct language on every switch.
+Your original setting is restored when LangSwitch quits. Because macOS only reads this setting
+at login, one logout or restart is needed for the native badge to fully disappear (and to
+reappear after quitting); until then both indicators may briefly show.
 
-CapsLangSwitcher sidesteps both. It remaps Caps Lock → **F18** at the HID level
-using `hidutil` — a remap that happens *below* the caps-lock activation delay, so
-the key fires as an ordinary key-down the instant it's pressed. The app then
-watches for F18 via a `CGEventTap`, swallows it, and calls the Text Input Source
-Services API (`TISSelectInputSource`) directly, in-process. No OS hotkey
-subsystem, no caps-lock firmware delay, nothing to wait on.
+## Security properties
 
-## Features
+- No third-party dependencies.
+- No telemetry, sockets, HTTP requests, update feed, or automatic updater.
+- No App Sandbox escape entitlement and no disabled Library Validation.
+- No runtime library search paths; every linked library resolves to an Apple system path.
+- The main app can launch at login through Apple's `SMAppService`; there is no bundled
+  helper, LaunchAgent plist, daemon, privileged helper, or root operation.
+- The only child commands are this same signed executable in watchdog mode and
+  `/usr/bin/hidutil` with fixed argument structure; no shell is used.
+- The global event tap forwards every key unchanged except F18. It never stores or logs
+  keyboard events. A local health check restores the mapping if the event tap stops.
+- Existing `UserKeyMapping` entries are snapshotted. Non-Caps-Lock mappings are preserved
+  while the app runs, and the exact baseline is restored on quit.
+- A separate restore watchdog restores the baseline if the GUI process crashes or is
+  force-quit. Normal `SIGTERM`, `SIGINT`, `SIGHUP`, and `SIGQUIT` also use AppKit's clean
+  shutdown path.
+- A per-user process lock prevents two GUI instances from racing over the HID mapping.
 
-- **Zero-delay switching** — bypasses the OS hotkey-disambiguation delay entirely
-- **Real Caps Lock repurposed** — the physical key never triggers actual caps
-  lock while the app is running
-- **Cycles any input sources** — works with however many keyboard layouts you
-  have enabled, not hardcoded to Thai/English
-- **Lives in the menu bar** — shows the current input source, no Dock icon
-- **Featherweight** — pure Swift, no Electron, tiny binary
-- **Auto-updates** — checks GitHub for new releases via Sparkle, in-app
+Accessibility permission is still required. macOS requires it for the global event tap
+that captures and swallows the remapped F18 key. LangSwitch does not request Full Disk
+Access, Input Monitoring as a separate permission, Screen Recording, Automation, or
+network access.
 
-## Install
-
-Download the latest build from [Releases](https://github.com/Gamezxz/CapsLangSwitcher/releases),
-unzip, and move `CapsLangSwitcher.app` to `/Applications`.
-
-Signed with a Developer ID and notarized by Apple — just double-click to open,
-no Gatekeeper warnings.
-
-### Build from source
+## One-command local install
 
 ```bash
-git clone https://github.com/Gamezxz/CapsLangSwitcher.git
-cd CapsLangSwitcher
-./build_app.sh
-open CapsLangSwitcher.app
+cd /Users/chayapats/Projects/langswitch
+./install_local.sh
 ```
 
-Requires Xcode Command Line Tools (Swift 5.9+).
+This builds, verifies, and installs the app atomically at
+`~/Applications/LangSwitch.app`, then opens it. On its first installed launch it asks
+macOS to enable **Launch at Login**. The menu-bar menu shows the current state and lets
+you disable it at any time. If macOS requires manual approval, the same menu item opens
+the correct Login Items settings page.
 
-## Setup
+The first menu row says **Status: Active — _input source_** when keyboard capture is
+working. While permission is missing it says **Waiting for Accessibility** and the
+menu-bar Caps Lock icon remains unfilled.
 
-1. Launch the app once — it will prompt for **Accessibility** access
-   (System Settings → Privacy & Security → Accessibility). Allow it. Once
-   granted, the app applies the Caps Lock → F18 remap automatically.
-2. Go to System Settings → Keyboard → Keyboard Shortcuts → Input Sources, and
-   turn off any existing shortcut bound to Caps Lock (e.g. "Select previous
-   input source") so it doesn't fight with the app.
-3. Tap Caps Lock. Your input source switches immediately.
+Move or install the app before granting Accessibility access so the permission is tied
+to its stable daily-use path.
 
-While the app runs, Caps Lock is fully repurposed (no actual caps-lock toggle).
-The remap is restored to normal on quit. If the app is force-killed, Caps Lock
-stays remapped until you relaunch it or log out; run
-`hidutil property --set '{"UserKeyMapping":[]}'` to reset it by hand.
+## Build only
 
-## How it works
+Requires macOS 12 or later and Xcode Command Line Tools with Swift 5.9 or later.
 
-- `CapsLockTap.swift` — on start, remaps Caps Lock (HID usage `0x700000039`) →
-  F18 (`0x70000006D`) via `hidutil property --set`. Then a `CGEventTap` at
-  `.cghidEventTap` watches for F18 key-downs (keycode 79), swallows them
-  (`return nil`), and fires `onTap` once per press (ignoring OS autorepeat).
-  The remap is cleared on quit.
-- `InputSourceSwitcher.swift` — enumerates the enabled, selectable keyboard
-  input sources via `TISCreateInputSourceList` and calls `TISSelectInputSource`
-  on the next one in the list, mirroring what the system's own "next input
-  source" shortcut does.
-- `main.swift` — a menu-bar-only (`LSUIElement`) app that wires the two
-  together, shows a menu bar icon, and clears the remap in
-  `applicationWillTerminate`.
-- Auto-update via [Sparkle](https://sparkle-project.org/) — checks
-  `docs/appcast.xml` on launch and daily. `make_release.sh` builds, signs,
-  notarizes, EdDSA-signs the update, and publishes a GitHub release in one go.
+```bash
+cd /Users/chayapats/Projects/langswitch
+./build_app.sh
+open LangSwitch.app
+```
 
-## License
+The default build is ad-hoc signed with Hardened Runtime and no entitlements. Grant
+Accessibility access to `LangSwitch.app` when macOS asks. Rebuilding an ad-hoc-signed app
+may cause macOS to ask again.
 
-MIT
+If a stable Apple Development or other code-signing identity is available, select it
+explicitly; the build script never searches the Keychain automatically:
+
+```bash
+SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./build_app.sh
+```
+
+The build-only command leaves `LangSwitch.app` in the project directory and does not
+install or launch it.
+
+## Recovery
+
+The app and watchdog normally restore the original mapping. If both processes are killed
+simultaneously, logging out resets the session mapping. On a machine with no other custom
+`hidutil` mappings, this command also clears it:
+
+```bash
+/usr/bin/hidutil property --set '{"UserKeyMapping":[]}'
+```
+
+Do not run that recovery command if you rely on other custom `hidutil` mappings; it clears
+all of them.
+
+## Limitations
+
+- A kernel failure, power loss, or killing both the GUI and watchdog at the same time can
+  prevent immediate restoration. macOS clears the mapping at logout.
+- The personal build is not notarized for distribution. It is intended for this machine.
+- There is deliberately no automatic update mechanism. Review and merge future upstream
+  changes manually.
+
+## Attribution and license
+
+The input-source switching and event-tap approach originated in CapsLangSwitcher by
+Gamezxz. This fork remains under the repository's MIT license; see `LICENSE`.

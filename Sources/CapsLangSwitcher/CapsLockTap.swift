@@ -1,32 +1,37 @@
 import Cocoa
 import CoreGraphics
+import LangSwitchCore
 
-/// Remaps Caps Lock → F18 at the HID level (via `hidutil`), then watches for F18 key-downs.
-///
-/// The HID remap happens *below* macOS's built-in Caps Lock activation delay (the firmware
-/// "hold briefly to engage" behavior on Apple keyboards), so the remapped key fires the
-/// instant Caps Lock is pressed — there's no caps-lock lag to wait through, and no
-/// `flagsChanged` round-trip. F18 is used because it's a real key code that's virtually
-/// never bound to anything, so we can safely swallow it.
+enum CapsLockTapError: LocalizedError {
+    case eventTapUnavailable
+    case eventTapStopped
+
+    var errorDescription: String? {
+        switch self {
+        case .eventTapUnavailable:
+            return "macOS refused to create the keyboard event tap. Confirm Accessibility access and relaunch LangSwitch."
+        case .eventTapStopped:
+            return "The keyboard event tap became unavailable. LangSwitch restored the previous Caps Lock mapping."
+        }
+    }
+}
+
+/// Captures only key-down/key-up events, forwards every key except F18 unchanged,
+/// and delegates reversible Caps Lock remapping to HIDMappingManager.
 final class CapsLockTap {
-    private let kVKF18: Int64 = 79
-
-    // HID usage codes for hidutil's UserKeyMapping (usage page 0x07 = keyboard).
-    private let capsLockUsage = 0x700000039
-    private let f18Usage = 0x70000006D
+    private let f18VirtualKeyCode: Int64 = 79
+    private let mappingManager = HIDMappingManager()
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private var healthTimer: Timer?
 
     var onTap: (() -> Void)?
+    var onFailure: ((Error) -> Void)?
     var isRunning: Bool { eventTap != nil }
 
-    func start() -> Bool {
-        guard eventTap == nil else { return true }
-
-        // Remap first, then listen. Only called once Accessibility is granted, so we never
-        // leave Caps Lock remapped to a dead key that we can't actually observe.
-        applyRemap()
+    func start() throws {
+        guard eventTap == nil else { return }
 
         let mask = CGEventMask(
             (1 << CGEventType.keyDown.rawValue) |
@@ -46,20 +51,42 @@ final class CapsLockTap {
             },
             userInfo: refcon
         ) else {
-            return false
+            throw CapsLockTapError.eventTapUnavailable
         }
 
         eventTap = tap
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
-        return true
+
+        do {
+            // Create the event tap first. The global remap is applied only after we know
+            // that macOS granted the ability to receive the remapped F18 events.
+            try mappingManager.activate()
+            CGEvent.tapEnable(tap: tap, enable: true)
+            healthTimer = Timer.scheduledTimer(
+                withTimeInterval: 2,
+                repeats: true
+            ) { [weak self] _ in
+                self?.verifyEventTap()
+            }
+        } catch {
+            removeEventTap()
+            throw error
+        }
     }
 
     func stop() {
-        guard let tap = eventTap else { return }
-        CGEvent.tapEnable(tap: tap, enable: false)
+        removeEventTap()
+        mappingManager.restoreOriginal()
+    }
+
+    private func removeEventTap() {
+        healthTimer?.invalidate()
+        healthTimer = nil
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
         if let source = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
         }
@@ -67,46 +94,40 @@ final class CapsLockTap {
         runLoopSource = nil
     }
 
+    private func verifyEventTap() {
+        guard let tap = eventTap else { return }
+
+        if CFMachPortIsValid(tap), !CGEvent.tapIsEnabled(tap: tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+
+        guard CFMachPortIsValid(tap), CGEvent.tapIsEnabled(tap: tap) else {
+            stop()
+            onFailure?(CapsLockTapError.eventTapStopped)
+            return
+        }
+    }
+
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            if let tap = eventTap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
             return Unmanaged.passUnretained(event)
         }
 
-        guard event.getIntegerValueField(.keyboardEventKeycode) == kVKF18 else {
+        guard event.getIntegerValueField(.keyboardEventKeycode) == f18VirtualKeyCode else {
             return Unmanaged.passUnretained(event)
         }
 
-        // Swallow both F18 down and up so the remapped key never reaches any other app.
-        // Switch on key-down only, ignoring OS autorepeat, so one physical tap = one switch.
-        // Called directly (not dispatched) — the tap already runs on the main run loop, so
-        // this is the fastest possible path from key press to input-source switch.
-        if type == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+        if type == .keyDown,
+           event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+            // Called directly (not dispatched) — the tap already runs on the main
+            // run loop, so this is the fastest path from key press to switch.
             onTap?()
         }
 
+        // Swallow only F18. Every other key is returned unchanged above.
         return nil
-    }
-
-    // MARK: - HID remap
-
-    func applyRemap() {
-        runHidutil(
-            "{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingSrc\":\(capsLockUsage),\"HIDKeyboardModifierMappingDst\":\(f18Usage)}]}"
-        )
-    }
-
-    /// Restores Caps Lock to its normal behavior. Call on quit so the key isn't left
-    /// remapped to a dead F18 while the app isn't running to handle it.
-    func clearRemap() {
-        runHidutil("{\"UserKeyMapping\":[]}")
-    }
-
-    private func runHidutil(_ mapping: String) {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/hidutil")
-        proc.arguments = ["property", "--set", mapping]
-        try? proc.run()
-        proc.waitUntilExit()
     }
 }
