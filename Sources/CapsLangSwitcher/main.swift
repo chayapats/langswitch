@@ -6,7 +6,6 @@ import LangSwitchCore
 import ServiceManagement
 
 private let launchAtLoginConfiguredKey = "didConfigureLaunchAtLogin"
-private let nativeIndicatorPriorValueKey = "nativeIndicatorPriorValue"   // "true" | "absent"
 private let nativeIndicatorNoticeShownKey = "didShowNativeIndicatorNotice"
 
 @available(macOS 13.0, *)
@@ -61,7 +60,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private weak var launchAtLoginItem: NSMenuItem?
     private weak var runtimeStatusItem: NSMenuItem?
     private var isTerminating = false
-    private var ownsNativeIndicatorSetting = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let lock = SingleInstanceLock() else {
@@ -252,33 +250,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     /// Disables macOS's native near-cursor language indicator, which shows the *previous*
     /// source after a programmatic switch. LangSwitch shows its own correct HUD instead.
-    /// Preference failures never throw and never block startup.
+    ///
+    /// `TSMLanguageIndicatorEnabled` is a global default macOS only re-reads at login, so it is
+    /// left disabled *persistently* and is NOT restored on quit: restoring it would let the
+    /// built-in badge win the next-login race (session agents read the pref before our login-item
+    /// re-disables it) and reappear every session. Takes effect after the next logout/restart.
+    /// Preference failures never throw or block startup.
     private func suppressNativeIndicator() {
-        ownsNativeIndicatorSetting = true
         let key = "TSMLanguageIndicatorEnabled" as CFString
         let current = CFPreferencesCopyAppValue(key, kCFPreferencesAnyApplication) as? Bool
-        guard current != false else { return }   // already suppressed (idempotent after crash)
-        if UserDefaults.standard.string(forKey: nativeIndicatorPriorValueKey) == nil {
-            UserDefaults.standard.set(current == true ? "true" : "absent",
-                                      forKey: nativeIndicatorPriorValueKey)
+        if current != false {   // idempotent: only write when not already disabled
+            CFPreferencesSetAppValue(key, kCFBooleanFalse, kCFPreferencesAnyApplication)
+            CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
         }
-        CFPreferencesSetAppValue(key, kCFBooleanFalse, kCFPreferencesAnyApplication)
-        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
         showNativeIndicatorNoticeIfNeeded()
-    }
-
-    /// Restores the value that existed before this app disabled the native indicator,
-    /// removing our override entirely if there was none. Only the instance that actually
-    /// suppressed the setting restores it, so a duplicate-instance launch cannot clobber it.
-    private func restoreNativeIndicator() {
-        guard ownsNativeIndicatorSetting,
-              let saved = UserDefaults.standard.string(forKey: nativeIndicatorPriorValueKey)
-        else { return }
-        let key = "TSMLanguageIndicatorEnabled" as CFString
-        CFPreferencesSetAppValue(key, saved == "true" ? kCFBooleanTrue : nil,
-                                 kCFPreferencesAnyApplication)   // nil removes our override
-        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
-        UserDefaults.standard.removeObject(forKey: nativeIndicatorPriorValueKey)
     }
 
     private func showNativeIndicatorNoticeIfNeeded() {
@@ -289,9 +274,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         alert.messageText = "LangSwitch replaces the macOS language indicator"
         alert.informativeText = """
         macOS's built-in near-cursor language indicator shows the previous language after a \
-        switch, so LangSwitch disables it and shows its own indicator with the correct language \
-        immediately. One logout or restart is needed for the native badge to fully disappear. \
-        LangSwitch restores your original setting when it quits.
+        switch, so LangSwitch disables it and shows its own indicator with the correct language. \
+        Log out or restart once for the built-in badge to disappear.
         """
         alert.runModal()
     }
@@ -392,7 +376,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         isTerminating = true
         DistributedNotificationCenter.default().removeObserver(self)
         tap.stop()
-        restoreNativeIndicator()
         signalHandler = nil
     }
 }
