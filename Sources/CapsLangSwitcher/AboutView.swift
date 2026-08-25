@@ -47,10 +47,6 @@ struct AboutView: View {
                     .font(.callout)
                     .multilineTextAlignment(.center)
             }
-
-            Text("Based on CapsLangSwitcher by Gamezxz (MIT)")
-                .font(.caption2)
-                .foregroundColor(.secondary)
         }
         .padding(28)
         .frame(width: 340)

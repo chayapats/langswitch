@@ -1,10 +1,7 @@
 # LangSwitch
 
-Personal hardened fork of [CapsLangSwitcher](https://github.com/Gamezxz/CapsLangSwitcher),
-based on audited upstream commit `34c5ef2d64b4c5c3a2df55c289a56667bd3adeeb`.
-
-Tap Caps Lock to cycle the enabled macOS keyboard input sources without the normal
-Caps Lock activation delay.
+Personal macOS menu-bar app. Tap Caps Lock to cycle the enabled keyboard input
+sources without the normal Caps Lock activation delay.
 
 ## Language indicator
 
@@ -101,10 +98,8 @@ all of them.
 - A kernel failure, power loss, or killing both the GUI and watchdog at the same time can
   prevent immediate restoration. macOS clears the mapping at logout.
 - The personal build is not notarized for distribution. It is intended for this machine.
-- There is deliberately no automatic update mechanism. Review and merge future upstream
-  changes manually.
+- There is deliberately no automatic update mechanism.
 
-## Attribution and license
+## License
 
-The input-source switching and event-tap approach originated in CapsLangSwitcher by
-Gamezxz. This fork remains under the repository's MIT license; see `LICENSE`.
+MIT. See `LICENSE`.
