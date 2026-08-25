@@ -31,15 +31,123 @@ enum HIDMappingPolicy {
     }
 }
 
+enum HIDUtilCompatibility {
+    /// macOS 27+ `hidutil property --get/--set` prints a per-device table instead of one
+    /// OpenStep value. Scope both operations to keyboards so we do not dump every HID service.
+    static let perDeviceTableMajorVersion = 27
+
+    static func usesPerDevicePropertyTable(
+        version: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+    ) -> Bool {
+        version.majorVersion >= perDeviceTableMajorVersion
+    }
+
+    static func propertyArguments(
+        getting key: String,
+        version: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+    ) -> [String] {
+        if usesPerDevicePropertyTable(version: version) {
+            return ["property", "--matching", "keyboard", "--get", key]
+        }
+        return ["property", "--get", key]
+    }
+
+    static func propertyArguments(
+        setting payload: String,
+        version: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+    ) -> [String] {
+        if usesPerDevicePropertyTable(version: version) {
+            return ["property", "--matching", "keyboard", "--set", payload]
+        }
+        return ["property", "--set", payload]
+    }
+}
+
 enum HIDMappingCodec {
     static func decodeHIDUtilOutput(_ data: Data) throws -> [HIDKeyMapping] {
         let text = String(decoding: data, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if text.isEmpty || text == "(null)" || text == "null" {
+        if isEmptyMappingText(text) {
             return []
         }
 
+        // Detect by shape, not only by OS version: the table format is what actually
+        // breaks the classic plist decoder, and hidutil may emit it independently of
+        // the marketing version string.
+        if looksLikeRegistryTable(text) {
+            return try decodeRegistryTable(text)
+        }
+
+        return try decodeSingleValue(text)
+    }
+
+    static func encodeSetPayload(_ mappings: [HIDKeyMapping]) throws -> String {
+        let data = try JSONEncoder().encode(HIDPropertyPayload(mappings: mappings))
+        guard let json = String(data: data, encoding: .utf8) else {
+            throw HIDMappingError.invalidOutput("Could not encode keyboard mappings")
+        }
+        return json
+    }
+
+    private static func isEmptyMappingText(_ text: String) -> Bool {
+        text.isEmpty || text == "(null)" || text == "null"
+    }
+
+    private static func looksLikeRegistryTable(_ text: String) -> Bool {
+        guard let firstLine = text.split(whereSeparator: \.isNewline).first else {
+            return false
+        }
+        return firstLine.contains("RegistryID")
+            && firstLine.contains("Key")
+            && firstLine.contains("Value")
+    }
+
+    private static func decodeRegistryTable(_ text: String) throws -> [HIDKeyMapping] {
+        let regex = try NSRegularExpression(
+            pattern: #"^(?:0x)?[0-9a-fA-F]+[ \t]+UserKeyMapping[ \t]+"#,
+            options: .anchorsMatchLines
+        )
+        let nsText = text as NSString
+        let matches = regex.matches(
+            in: text,
+            range: NSRange(location: 0, length: nsText.length)
+        )
+        guard !matches.isEmpty else { return [] }
+
+        var devices: [[HIDKeyMapping]] = []
+        devices.reserveCapacity(matches.count)
+        for (index, match) in matches.enumerated() {
+            let start = match.range.upperBound
+            let end = index + 1 < matches.count
+                ? matches[index + 1].range.lowerBound
+                : nsText.length
+            let value = nsText.substring(with: NSRange(location: start, length: end - start))
+            devices.append(try decodeSingleValue(value))
+        }
+        return mergeDeviceMappings(devices)
+    }
+
+    private static func mergeDeviceMappings(_ devices: [[HIDKeyMapping]]) -> [HIDKeyMapping] {
+        var seen: Set<UInt64> = []
+        var merged: [HIDKeyMapping] = []
+        for mappings in devices {
+            for mapping in mappings {
+                if seen.insert(mapping.source).inserted {
+                    merged.append(mapping)
+                }
+            }
+        }
+        return merged
+    }
+
+    private static func decodeSingleValue(_ text: String) throws -> [HIDKeyMapping] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isEmptyMappingText(trimmed) {
+            return []
+        }
+
+        let data = Data(trimmed.utf8)
         if let payload = try? JSONDecoder().decode(HIDPropertyPayload.self, from: data) {
             return payload.mappings
         }
@@ -47,12 +155,21 @@ enum HIDMappingCodec {
             return mappings
         }
 
-        var format = PropertyListSerialization.PropertyListFormat.openStep
-        let propertyList = try PropertyListSerialization.propertyList(
-            from: data,
-            options: [],
-            format: &format
-        )
+        return try decodePropertyListMappings(data)
+    }
+
+    private static func decodePropertyListMappings(_ data: Data) throws -> [HIDKeyMapping] {
+        let propertyList: Any
+        do {
+            var format = PropertyListSerialization.PropertyListFormat.openStep
+            propertyList = try PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: &format
+            )
+        } catch {
+            throw HIDMappingError.invalidOutput("Unexpected hidutil property-list shape")
+        }
 
         let rawMappings: [Any]
         if let array = propertyList as? [Any] {
@@ -73,14 +190,6 @@ enum HIDMappingCodec {
             }
             return HIDKeyMapping(source: source, destination: destination)
         }
-    }
-
-    static func encodeSetPayload(_ mappings: [HIDKeyMapping]) throws -> String {
-        let data = try JSONEncoder().encode(HIDPropertyPayload(mappings: mappings))
-        guard let json = String(data: data, encoding: .utf8) else {
-            throw HIDMappingError.invalidOutput("Could not encode keyboard mappings")
-        }
-        return json
     }
 
     private static func uint64(_ value: Any?) -> UInt64? {
@@ -174,13 +283,15 @@ public final class HIDMappingManager {
     }
 
     private static func readMappings() throws -> [HIDKeyMapping] {
-        let result = try runHIDUtil(["property", "--get", "UserKeyMapping"])
+        let result = try runHIDUtil(
+            HIDUtilCompatibility.propertyArguments(getting: "UserKeyMapping")
+        )
         return try HIDMappingCodec.decodeHIDUtilOutput(result)
     }
 
     private static func setMappings(_ mappings: [HIDKeyMapping]) throws {
         let payload = try HIDMappingCodec.encodeSetPayload(mappings)
-        _ = try runHIDUtil(["property", "--set", payload])
+        _ = try runHIDUtil(HIDUtilCompatibility.propertyArguments(setting: payload))
     }
 
     private static func runHIDUtil(_ arguments: [String]) throws -> Data {
