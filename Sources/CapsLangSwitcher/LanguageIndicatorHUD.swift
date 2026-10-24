@@ -27,11 +27,14 @@ final class LanguageIndicatorHUD {
         panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        panel.hasShadow = false
         panel.ignoresMouseEvents = true
         panel.hidesOnDeactivate = false
+        panel.isFloatingPanel = true
         panel.isReleasedWhenClosed = false          // reused panel; never let AppKit free it
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        panel.collectionBehavior = [
+            .canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle,
+        ]
 
         // Solid blue pill matching the native input-source indicator (replaces the
         // former .hudWindow blur). One fixed look, so the color is snapshotted once.
@@ -126,6 +129,9 @@ final class LanguageIndicatorHUD {
     /// never triggers a permission prompt.
     private func caretScreenRect() -> NSRect? {
         let systemWide = AXUIElementCreateSystemWide()
+        // Bound AX IPC so a hung app cannot stall the main run loop (and the
+        // keyboard tap that shares it) while resolving the caret.
+        AXUIElementSetMessagingTimeout(systemWide, 0.08)
 
         var focusedRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
@@ -134,6 +140,7 @@ final class LanguageIndicatorHUD {
             let focusedRef, CFGetTypeID(focusedRef) == AXUIElementGetTypeID()
         else { return nil }
         let focused = focusedRef as! AXUIElement
+        AXUIElementSetMessagingTimeout(focused, 0.08)
 
         var rangeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
@@ -159,8 +166,11 @@ final class LanguageIndicatorHUD {
         guard axRect.height > 0, axRect != .zero else { return nil }
 
         // AX returns Quartz screen coords (top-left origin of the primary display);
-        // flip to AppKit's bottom-left origin using the primary screen's height.
-        guard let primary = NSScreen.screens.first else { return nil }
+        // flip to AppKit's bottom-left origin using the primary screen's height
+        // (the screen whose frame origin is (0,0)), not the caret's screen.
+        guard let primary = NSScreen.screens.first(where: { $0.frame.origin == .zero })
+                ?? NSScreen.screens.first
+        else { return nil }
         return NSRect(
             x: axRect.minX,
             y: primary.frame.height - axRect.maxY,

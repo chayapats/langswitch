@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import IOKit.hid
 
 struct HIDKeyMapping: Codable, Equatable {
     let source: UInt64
@@ -28,6 +29,16 @@ enum HIDMappingPolicy {
         baseline.filter { $0.source != capsLockUsage } + [
             HIDKeyMapping(source: capsLockUsage, destination: f18Usage),
         ]
+    }
+
+    /// On macOS 27+ mappings are per HID service. A merged snapshot can look fine
+    /// while a keyboard that slept or reconnected still has an empty table.
+    static func needsCapsLockRemapReapply(devices: [[HIDKeyMapping]]) -> Bool {
+        devices.contains { mappings in
+            !mappings.contains {
+                $0.source == capsLockUsage && $0.destination == f18Usage
+            }
+        }
     }
 }
 
@@ -65,21 +76,29 @@ enum HIDUtilCompatibility {
 
 enum HIDMappingCodec {
     static func decodeHIDUtilOutput(_ data: Data) throws -> [HIDKeyMapping] {
+        mergeDeviceMappings(try decodeHIDUtilDevices(data))
+    }
+
+    /// One array per HID service in a macOS 27+ registry table. Classic hidutil
+    /// output is treated as a single device. Used to find keyboards that lost
+    /// the Caps Lock remap after a Bluetooth reconnect.
+    static func decodeHIDUtilDevices(_ data: Data) throws -> [[HIDKeyMapping]] {
         let text = String(decoding: data, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         if isEmptyMappingText(text) {
-            return []
+            return [[]]
         }
 
         // Detect by shape, not only by OS version: the table format is what actually
         // breaks the classic plist decoder, and hidutil may emit it independently of
         // the marketing version string.
         if looksLikeRegistryTable(text) {
-            return try decodeRegistryTable(text)
+            let devices = try decodeRegistryTableDevices(text)
+            return devices.isEmpty ? [[]] : devices
         }
 
-        return try decodeSingleValue(text)
+        return [try decodeSingleValue(text)]
     }
 
     static func encodeSetPayload(_ mappings: [HIDKeyMapping]) throws -> String {
@@ -103,7 +122,7 @@ enum HIDMappingCodec {
             && firstLine.contains("Value")
     }
 
-    private static func decodeRegistryTable(_ text: String) throws -> [HIDKeyMapping] {
+    private static func decodeRegistryTableDevices(_ text: String) throws -> [[HIDKeyMapping]] {
         let regex = try NSRegularExpression(
             pattern: #"^(?:0x)?[0-9a-fA-F]+[ \t]+UserKeyMapping[ \t]+"#,
             options: .anchorsMatchLines
@@ -125,7 +144,7 @@ enum HIDMappingCodec {
             let value = nsText.substring(with: NSRange(location: start, length: end - start))
             devices.append(try decodeSingleValue(value))
         }
-        return mergeDeviceMappings(devices)
+        return devices
     }
 
     private static func mergeDeviceMappings(_ devices: [[HIDKeyMapping]]) -> [HIDKeyMapping] {
@@ -226,16 +245,29 @@ enum HIDMappingError: LocalizedError {
 public final class HIDMappingManager {
     private static let hidutilURL = URL(fileURLWithPath: "/usr/bin/hidutil")
     private static let watchdogFlag = "--restore-hid-mapping-watchdog"
+    private static let reapplyDelay: TimeInterval = 0.5
+
+    private let hidQueue = DispatchQueue(label: "com.chayapats.langswitch.hid")
+    private let stateLock = NSLock()
 
     private var baseline: [HIDKeyMapping]?
     private var watchdog: Process?
     private var watchdogInput: Pipe?
     private var isApplied = false
+    private var hidManager: IOHIDManager?
+    private var reapplyWorkItem: DispatchWorkItem?
 
     public init() {}
 
+    deinit {
+        stopKeyboardWatch()
+    }
+
     public func activate() throws {
-        guard !isApplied else { return }
+        stateLock.lock()
+        let alreadyApplied = isApplied
+        stateLock.unlock()
+        guard !alreadyApplied else { return }
 
         // Preserve every mapping exactly, even if the user already maps Caps Lock to F18.
         // Guessing that such a mapping is stale could destroy intentional user state.
@@ -256,30 +288,140 @@ public final class HIDMappingManager {
             throw error
         }
 
+        stateLock.lock()
         baseline = original
         watchdog = child
         watchdogInput = childInput
         isApplied = true
+        stateLock.unlock()
+
+        // macOS 27 stores UserKeyMapping per HID service. A Bluetooth keyboard that
+        // reconnects gets a new empty table and Caps Lock falls back to the OS delay.
+        startKeyboardWatch()
     }
 
     @discardableResult
     public func restoreOriginal() -> Bool {
-        guard let baseline else { return true }
+        reapplyWorkItem?.cancel()
+        reapplyWorkItem = nil
+        stopKeyboardWatch()
+        // Finish any in-flight reapply before restoring the snapshot.
+        hidQueue.sync {}
+
+        stateLock.lock()
+        let snapshot = baseline
+        stateLock.unlock()
+        guard let snapshot else { return true }
 
         do {
-            try Self.setMappings(baseline)
+            try Self.setMappings(snapshot)
+            stateLock.lock()
             isApplied = false
-            self.baseline = nil
-            watchdog?.terminate()
-            try? watchdogInput?.fileHandleForWriting.close()
+            baseline = nil
+            let child = watchdog
+            let childInput = watchdogInput
             watchdog = nil
             watchdogInput = nil
+            stateLock.unlock()
+            child?.terminate()
+            try? childInput?.fileHandleForWriting.close()
             return true
         } catch {
             // Keep the watchdog alive. Once this process exits it retries the restore
             // independently for ten seconds.
             return false
         }
+    }
+
+    /// Re-applies Caps Lock → F18 to every matching keyboard. Safe to call after
+    /// sleep or when a Bluetooth keyboard may have come back with an empty table.
+    public func reapplyActive() {
+        hidQueue.async { [weak self] in
+            self?.applyActiveMappings()
+        }
+    }
+
+    /// Reads the per-device table and only writes if a keyboard lost the remap.
+    public func reapplyActiveIfNeeded() {
+        hidQueue.async { [weak self] in
+            self?.applyActiveMappingsIfNeeded()
+        }
+    }
+
+    private func startKeyboardWatch() {
+        stopKeyboardWatch()
+
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        let matching: [String: Any] = [
+            kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+            kIOHIDDeviceUsageKey as String: kHIDUsage_GD_Keyboard,
+        ]
+        IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
+        IOHIDManagerRegisterDeviceMatchingCallback(
+            manager,
+            { context, result, _, _ in
+                guard result == kIOReturnSuccess, let context else { return }
+                let this = Unmanaged<HIDMappingManager>.fromOpaque(context).takeUnretainedValue()
+                this.scheduleReapplyFromNewDevice()
+            },
+            Unmanaged.passUnretained(self).toOpaque()
+        )
+        IOHIDManagerScheduleWithRunLoop(
+            manager,
+            CFRunLoopGetMain(),
+            CFRunLoopMode.defaultMode.rawValue
+        )
+        IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        hidManager = manager
+    }
+
+    private func stopKeyboardWatch() {
+        guard let manager = hidManager else { return }
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, nil, nil)
+        IOHIDManagerUnscheduleFromRunLoop(
+            manager,
+            CFRunLoopGetMain(),
+            CFRunLoopMode.defaultMode.rawValue
+        )
+        IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        hidManager = nil
+    }
+
+    private func scheduleReapplyFromNewDevice() {
+        stateLock.lock()
+        let running = isApplied
+        stateLock.unlock()
+        guard running else { return }
+
+        reapplyWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.applyActiveMappings()
+        }
+        reapplyWorkItem = work
+        hidQueue.asyncAfter(deadline: .now() + Self.reapplyDelay, execute: work)
+    }
+
+    private func applyActiveMappings() {
+        guard let active = snapshotActiveMappings() else { return }
+        try? Self.setMappings(active)
+    }
+
+    private func applyActiveMappingsIfNeeded() {
+        guard let active = snapshotActiveMappings() else { return }
+        guard let data = try? Self.runHIDUtil(
+            HIDUtilCompatibility.propertyArguments(getting: "UserKeyMapping")
+        ),
+            let devices = try? HIDMappingCodec.decodeHIDUtilDevices(data),
+            HIDMappingPolicy.needsCapsLockRemapReapply(devices: devices)
+        else { return }
+        try? Self.setMappings(active)
+    }
+
+    private func snapshotActiveMappings() -> [HIDKeyMapping]? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard isApplied, let baseline else { return nil }
+        return HIDMappingPolicy.activeMappings(from: baseline)
     }
 
     private static func readMappings() throws -> [HIDKeyMapping] {

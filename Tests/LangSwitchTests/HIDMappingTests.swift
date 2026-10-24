@@ -181,4 +181,65 @@ final class HIDMappingTests: XCTestCase {
             ]
         )
     }
+
+    func testPerDeviceDecodeKeepsUnmappedKeyboardVisible() throws {
+        let output = """
+        RegistryID  Key                   Value
+        10000b0c9   UserKeyMapping   (
+        )
+        100000cdf   UserKeyMapping   (
+                {
+                HIDKeyboardModifierMappingDst = 30064771181;
+                HIDKeyboardModifierMappingSrc = 30064771129;
+            }
+        )
+        """
+
+        let devices = try HIDMappingCodec.decodeHIDUtilDevices(Data(output.utf8))
+        XCTAssertEqual(devices.count, 2)
+        XCTAssertEqual(devices[0], [])
+        XCTAssertEqual(
+            devices[1],
+            [HIDKeyMapping(source: 30064771129, destination: 30064771181)]
+        )
+        XCTAssertTrue(HIDMappingPolicy.needsCapsLockRemapReapply(devices: devices))
+        XCTAssertEqual(
+            try HIDMappingCodec.decodeHIDUtilOutput(Data(output.utf8)),
+            [HIDKeyMapping(source: 30064771129, destination: 30064771181)],
+            "Merged decode hides the unmapped keyboard; reapply must use per-device tables"
+        )
+    }
+
+    func testMappedKeyboardsDoNotNeedReapply() throws {
+        let output = """
+        RegistryID  Key                   Value
+        100000cdf   UserKeyMapping   (
+                {
+                HIDKeyboardModifierMappingDst = 30064771181;
+                HIDKeyboardModifierMappingSrc = 30064771129;
+            }
+        )
+        100001389   UserKeyMapping   (
+                {
+                HIDKeyboardModifierMappingDst = 30064771181;
+                HIDKeyboardModifierMappingSrc = 30064771129;
+            }
+        )
+        """
+
+        let devices = try HIDMappingCodec.decodeHIDUtilDevices(Data(output.utf8))
+        XCTAssertFalse(HIDMappingPolicy.needsCapsLockRemapReapply(devices: devices))
+    }
+
+    func testClassicSingleDeviceUsesCapsLockRemapCheck() throws {
+        let mapped = [HIDKeyMapping(
+            source: HIDMappingPolicy.capsLockUsage,
+            destination: HIDMappingPolicy.f18Usage
+        )]
+        XCTAssertFalse(HIDMappingPolicy.needsCapsLockRemapReapply(devices: [mapped]))
+        XCTAssertTrue(HIDMappingPolicy.needsCapsLockRemapReapply(devices: [[]]))
+        XCTAssertTrue(HIDMappingPolicy.needsCapsLockRemapReapply(devices: [
+            [HIDKeyMapping(source: 10, destination: 20)],
+        ]))
+    }
 }

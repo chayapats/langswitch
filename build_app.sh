@@ -46,9 +46,17 @@ if /usr/bin/otool -l "$APP_DIR/Contents/MacOS/$APP_NAME" | /usr/bin/grep -q "LC_
   exit 1
 fi
 
-if [ -n "${SIGN_IDENTITY:-}" ]; then
-  echo "Signing with the explicitly supplied identity: $SIGN_IDENTITY"
-  /usr/bin/codesign --force --options runtime --sign "$SIGN_IDENTITY" "$APP_DIR"
+DEFAULT_DEVELOPER_ID="Developer ID Application: Chayapat Sriwattanachote (SRAQ34JPLS)"
+if [ -z "${SIGN_IDENTITY:-}" ]; then
+  if /usr/bin/security find-identity -v -p codesigning | /usr/bin/grep -F -q "$DEFAULT_DEVELOPER_ID"; then
+    SIGN_IDENTITY="$DEFAULT_DEVELOPER_ID"
+  fi
+fi
+
+if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ]; then
+  echo "Signing with $SIGN_IDENTITY (hardened runtime, timestamped for notarization)"
+  /usr/bin/codesign --force --options runtime --timestamp \
+    --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP_DIR"
 else
   echo "Ad-hoc signing with Hardened Runtime (set SIGN_IDENTITY for a stable identity)"
   /usr/bin/codesign --force --options runtime --sign - --identifier "$BUNDLE_ID" "$APP_DIR"

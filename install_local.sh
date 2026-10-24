@@ -26,6 +26,12 @@ if /usr/bin/pgrep -x "$APP_NAME" >/dev/null 2>&1; then
 fi
 
 "$PWD/build_app.sh"
+
+# `codesign -d` exits 1 even when it prints successfully.
+codesign_info="$(/usr/bin/codesign -dvv "$APP_NAME.app" 2>&1 || true)"
+if printf '%s\n' "$codesign_info" | /usr/bin/grep -q "Authority=Developer ID Application"; then
+  "$PWD/notarize.sh"
+fi
 /bin/mkdir -p "$INSTALL_ROOT"
 /bin/rm -rf "$STAGING" "$BACKUP"
 /usr/bin/ditto "$APP_NAME.app" "$STAGING"

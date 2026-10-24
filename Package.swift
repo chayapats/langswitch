@@ -10,7 +10,10 @@ let package = Package(
     targets: [
         .target(
             name: "LangSwitchCore",
-            path: "Sources/LangSwitchCore"
+            path: "Sources/LangSwitchCore",
+            linkerSettings: [
+                .linkedFramework("IOKit"),
+            ]
         ),
         .executableTarget(
             name: "LangSwitch",

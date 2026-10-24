@@ -25,6 +25,7 @@ final class CapsLockTap {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var healthTimer: Timer?
+    private var wakeObserver: NSObjectProtocol?
 
     var onTap: (() -> Void)?
     var onFailure: ((Error) -> Void)?
@@ -64,11 +65,16 @@ final class CapsLockTap {
             // that macOS granted the ability to receive the remapped F18 events.
             try mappingManager.activate()
             CGEvent.tapEnable(tap: tap, enable: true)
+            startWakeObserver()
             healthTimer = Timer.scheduledTimer(
                 withTimeInterval: 2,
                 repeats: true
             ) { [weak self] _ in
-                self?.verifyEventTap()
+                guard let self else { return }
+                self.verifyEventTap()
+                if self.isRunning {
+                    self.mappingManager.reapplyActiveIfNeeded()
+                }
             }
         } catch {
             removeEventTap()
@@ -82,6 +88,7 @@ final class CapsLockTap {
     }
 
     private func removeEventTap() {
+        stopWakeObserver()
         healthTimer?.invalidate()
         healthTimer = nil
         if let tap = eventTap {
@@ -92,6 +99,27 @@ final class CapsLockTap {
         }
         eventTap = nil
         runLoopSource = nil
+    }
+
+    private func startWakeObserver() {
+        stopWakeObserver()
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                guard let self, self.isRunning else { return }
+                self.mappingManager.reapplyActive()
+            }
+        }
+    }
+
+    private func stopWakeObserver() {
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+            self.wakeObserver = nil
+        }
     }
 
     private func verifyEventTap() {

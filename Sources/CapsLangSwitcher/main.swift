@@ -102,9 +102,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func startTap() {
-        tap.onTap = { [weak self] in
+        tap.onTap = {
             InputSourceSwitcher.selectNext()
-            self?.updateStatusTitle()
         }
         tap.onFailure = { [weak self] error in
             guard let self, !self.isTerminating else { return }
@@ -143,7 +142,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc private func inputSourceDidChange() {
         updateStatusTitle()
         guard let source = InputSourceSwitcher.currentSource() else { return }
-        hud.show(for: source)
+        // Defer the HUD off the current turn so a synchronously delivered TIS
+        // notification cannot run Accessibility queries inside the event-tap callback.
+        DispatchQueue.main.async { [weak self] in
+            self?.hud.show(for: source)
+        }
     }
 
     @objc private func updateStatusTitle() {
