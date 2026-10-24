@@ -3,6 +3,10 @@
 Personal macOS menu-bar app. Tap Caps Lock to cycle the enabled keyboard input
 sources without the normal Caps Lock activation delay.
 
+Built on [CapsLangSwitcher](https://github.com/Gamezxz/CapsLangSwitcher) by Gamezxz
+(MIT), starting from upstream commit `34c5ef2`, then hardened and extended
+(custom language indicator, macOS 27 per-device HID mappings, no auto-updater).
+
 ## Language indicator
 
 macOS's built-in near-cursor language indicator (`TSMLanguageIndicatorEnabled`) shows the
@@ -100,6 +104,8 @@ all of them.
 - The personal build is not notarized for distribution. It is intended for this machine.
 - There is deliberately no automatic update mechanism.
 
-## License
+## Attribution and license
 
-MIT. See `LICENSE`.
+The input-source switching and event-tap approach originated in
+[CapsLangSwitcher](https://github.com/Gamezxz/CapsLangSwitcher) by Gamezxz.
+This project remains under the MIT license; see `LICENSE`.
